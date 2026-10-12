@@ -28,7 +28,7 @@
 //! Both sides reuse output storage in the reused and presized groups. C still
 //! creates and destroys encoder state for every independent stream.
 //!
-//! A full corpus checkout provides 682 paired Rust/C cases.
+//! A full corpus checkout covers paired Rust/C cases across sizes and API modes.
 //! Tiny payloads are validated at each quality before their timing begins.
 
 #[cfg(not(feature = "no_std"))]
@@ -532,6 +532,20 @@ fn bench_cold(criterion: &mut Criterion) {
     // command-pricing costs, including the H5/H6 size-hint boundary at 1 MiB.
     corpora.push(Corpus::new("incompressible-1MiB", incompressible(1 << 20)));
     corpora.push(Corpus::new("repeated-1MiB", vec![b'a'; 1 << 20]));
+    // Bounded chains trade insertion cost against traversal depth. Real text
+    // on both sides of the 32 KiB choice catches a gain bought by slower scans.
+    let alice = include_bytes!("../brotli-ffi/vendor/brotli/tests/testdata/alice29.txt");
+    for size in [8 << 10, 32 << 10, 64 << 10] {
+        corpora.push(Corpus::new(
+            format!("alice-{}KiB", size >> 10),
+            alice[..size].to_vec(),
+        ));
+    }
+    corpora.push(Corpus::new(
+        "binary-64KiB",
+        (0..65_536usize).map(|ix| ((ix / 16) ^ ix) as u8).collect(),
+    ));
+    corpora.push(Corpus::new("incompressible-64KiB", incompressible(1 << 16)));
 
     println!("corpus validation (lgwin {})", LGWIN.bits());
 
