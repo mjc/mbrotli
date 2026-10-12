@@ -937,6 +937,13 @@ impl<
 /// slots indexes after a sixteen-kilobyte clear.
 const COMPACT_INPUT_LIMIT: usize = 1024;
 
+/// A complete input this short cannot wrap a bucket's sixteen-bit counter:
+/// stores are strictly increasing and require at least four readable bytes.
+const DIRECT_CHAIN_INPUT_LIMIT: usize = 1 << 16;
+
+/// Longer ordinary inputs spend enough time traversing chains to prefer buckets.
+const DIRECT_CHAIN_ORDINARY_LIMIT: usize = 1 << 15;
+
 /// Positions an on-demand search runs between two looks at its store rate
 /// (see [`Matcher::checkpoint`]).
 ///
@@ -1105,15 +1112,17 @@ fn hash_with_tag<const HASH64: bool, const BUCKETS: usize>(data: &[u8], offset: 
 
 /// Storage owned exclusively by the current bucket layout.
 enum Layout<const BUCKETS: usize, const BLOCK: usize, const SLOTS: usize> {
-    Compact(CompactLayout),
+    Compact(CompactLayout<BUCKETS>),
     Sparse(SparseLayout<BUCKETS, BLOCK>),
     Dense(DenseLayout<BUCKETS, BLOCK, SLOTS>),
 }
 
-/// Short-stream bucket heads and linked positions.
+/// Bounded-stream bucket heads and linked positions.
 #[derive(Default)]
-struct CompactLayout {
+struct CompactLayout<const BUCKETS: usize> {
     compact: KeyMap,
+    /// Direct heads for bounded one-shot inputs; absent for the tiny key map.
+    heads: Option<Box<[u32; BUCKETS]>>,
     /// Low word: position; high word: one-based index of the older node.
     chain: Vec<u64>,
 }
@@ -1197,7 +1206,10 @@ const fn last_distances_for(block: usize) -> usize {
 /// bumping the generation. A one-shot stream of at most
 /// [`COMPACT_INPUT_LIMIT`] bytes uses neither: it links every store into a
 /// per-bucket chain indexed through a small [`KeyMap`], so a sixteen-byte
-/// call never zeroes the table and a store is one push.
+/// call never zeroes the table and a store is one push. Deep shapes also use
+/// chains for complete inputs through 32 KiB, and through 64 KiB when the
+/// sample predicts incompressibility. Those chains have direct bucket heads:
+/// no key map, per-bucket counter, starter promotion, or full-block copying.
 ///
 /// Slots fill downwards, as the reference's tagged matchers do: the newest
 /// position sits at the lowest occupied slot and older ones follow it
@@ -1274,6 +1286,11 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
             + match &self.layout {
                 Layout::Compact(layout) => {
                     (layout.compact.entries.capacity() + layout.chain.capacity()) * size_of::<u64>()
+                        + if layout.heads.is_some() {
+                            BUCKETS * size_of::<u32>()
+                        } else {
+                            0
+                        }
                 }
                 Layout::Sparse(layout) => {
                     BUCKETS * size_of::<u64>()
@@ -1469,16 +1486,34 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     /// `block` is the stream's first block, which [`Self::wants_dense`] may
     /// sample.
     fn select_layout(&mut self, one_shot: bool, input_size: usize, block: &[u8]) {
+        let direct = matches!(self.layout, Layout::Compact(_))
+            && one_shot
+            && !Self::TAGGED
+            && input_size > COMPACT_INPUT_LIMIT
+            && input_size <= DIRECT_CHAIN_INPUT_LIMIT
+            && (input_size <= DIRECT_CHAIN_ORDINARY_LIMIT
+                || matches!(
+                    sample_store_outlook(block),
+                    Some(StoreOutlook::Incompressible)
+                ));
         let compact = matches!(self.layout, Layout::Compact(_))
             && one_shot
-            && input_size <= COMPACT_INPUT_LIMIT;
+            && (input_size <= COMPACT_INPUT_LIMIT || direct);
         let dense =
             matches!(self.layout, Layout::Dense(_)) || (!compact && self.wants_dense(block));
         let previous =
             ::core::mem::replace(&mut self.layout, Layout::Compact(CompactLayout::default()));
         self.layout = match previous {
             Layout::Compact(mut layout) if compact => {
-                layout.compact.reset(input_size);
+                if direct {
+                    match layout.heads.as_deref_mut() {
+                        Some(heads) => heads.fill(0),
+                        None => layout.heads = Some(fixed_table(0)),
+                    }
+                } else {
+                    layout.heads = None;
+                    layout.compact.reset(input_size);
+                }
                 layout.chain.clear();
                 layout.chain.reserve(input_size);
                 Layout::Compact(layout)
@@ -1533,7 +1568,7 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     }
 }
 
-impl CompactLayout {
+impl<const BUCKETS: usize> CompactLayout<BUCKETS> {
     /// Links `ix` in front of the chain of `key`, whose map entry — at
     /// `slot`, already read as `count` stores and chain head `head` — is
     /// then updated to name the new node.
@@ -1678,10 +1713,10 @@ impl<const BUCKETS: usize, const BLOCK: usize, const SLOTS: usize>
     }
 }
 
-impl<const BUCKETS: usize, const BLOCK: usize> From<CompactLayout>
+impl<const BUCKETS: usize, const BLOCK: usize> From<CompactLayout<BUCKETS>>
     for SparseLayout<BUCKETS, BLOCK>
 {
-    fn from(compact: CompactLayout) -> Self {
+    fn from(compact: CompactLayout<BUCKETS>) -> Self {
         // Keep the larger u64 allocation; discard its old map/chain encoding.
         let mut entries = if compact.compact.entries.capacity() >= compact.chain.capacity() {
             compact.compact.entries
@@ -2550,7 +2585,7 @@ struct SparseRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usiz
 
 /// Compact storage borrowed once per block.
 struct CompactRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usize>(
-    &'a mut CompactLayout,
+    &'a mut CompactLayout<BUCKETS>,
 );
 
 impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
@@ -2582,6 +2617,75 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
     ) {
         self.layout
             .search::<S, HASH64>(simd, stats, query, out, self.size_hint);
+    }
+}
+
+/// Direct bucket heads and append-only nodes for a bounded, complete input.
+/// The head table and dispatch are fixed for the whole run. Unlike sparse
+/// buckets, appending a node never allocates or copies a larger bucket.
+struct DirectChainRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> {
+    heads: &'a mut [u32; BUCKETS],
+    chain: &'a mut Vec<u64>,
+}
+
+impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize>
+    DirectChainRun<'_, HASH64, BUCKETS, BLOCK>
+{
+    /// Prepends a position to its bucket. Zero terminates a chain; heads
+    /// and links are one-based indices into the shared node buffer.
+    #[inline(always)]
+    fn push(&mut self, key: usize, ix: u32) {
+        let head = &mut self.heads[key & (BUCKETS - 1)];
+        self.chain.push(u64::from(ix) | (u64::from(*head) << 32));
+        *head = self.chain.len() as u32;
+    }
+}
+
+impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
+    for DirectChainRun<'_, HASH64, BUCKETS, BLOCK>
+{
+    const HASH_TYPE_LENGTH: usize = if HASH64 { 8 } else { 4 };
+    const STORE_LOOKAHEAD: usize = Self::HASH_TYPE_LENGTH;
+
+    #[inline(always)]
+    fn store(&mut self, data: &[u8], mask: usize, ix: usize) {
+        let hash = hash_with_tag::<HASH64, BUCKETS>(data, ix & mask);
+        self.push(hash >> 8, ix as u32);
+    }
+
+    fn store_range(&mut self, data: &[u8], mask: usize, start: usize, end: usize) {
+        let first = self.chain.len() + 1;
+        let heads = &mut *self.heads;
+        // The exact-size iterator lets Vec reserve once and write the nodes
+        // without a capacity check or a published length at every position.
+        self.chain
+            .extend((start..end).enumerate().map(|(offset, ix)| {
+                let hash = hash_with_tag::<HASH64, BUCKETS>(data, ix & mask);
+                let head = &mut heads[(hash >> 8) & (BUCKETS - 1)];
+                let node = u64::from(ix as u32) | (u64::from(*head) << 32);
+                *head = (first + offset) as u32;
+                node
+            }));
+    }
+
+    #[inline(always)]
+    fn find_longest_match<S: Simd>(
+        &mut self,
+        simd: S,
+        stats: &mut DictionaryStats,
+        query: MatchQuery<'_>,
+        out: &mut SearchResult,
+    ) {
+        let min_score = out.score;
+        let hash = hash_with_tag::<HASH64, BUCKETS>(query.data, query.cur_ix & query.mask);
+        let key = (hash >> 8) & (BUCKETS - 1);
+        // No counter is needed: the chain ends at zero, the walk is capped
+        // at BLOCK, and a complete <=64 KiB input cannot wrap C's counter.
+        search_chain::<S, HASH64, BLOCK>(simd, &query, out, u16::MAX, self.heads[key], self.chain);
+        self.push(key, query.cur_ix as u32);
+        if min_score == out.score {
+            query.search_dictionary::<false>(stats, out);
+        }
     }
 }
 
@@ -2718,7 +2822,13 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     fn visit_run<V: RunVisitor>(&mut self, visitor: V) -> V::Output {
         match &mut self.layout {
             Layout::Dense(layout) => visitor.visit(layout.dense_run::<HASH64>()),
-            Layout::Compact(layout) => visitor.visit(CompactRun::<HASH64, BUCKETS, BLOCK>(layout)),
+            Layout::Compact(layout) => match layout.heads.as_deref_mut() {
+                Some(heads) => visitor.visit(DirectChainRun::<HASH64, BUCKETS, BLOCK> {
+                    heads,
+                    chain: &mut layout.chain,
+                }),
+                None => visitor.visit(CompactRun::<HASH64, BUCKETS, BLOCK>(layout)),
+            },
             Layout::Sparse(layout) => visitor.visit(SparseRun::<HASH64, BUCKETS, BLOCK> {
                 layout,
                 size_hint: self.size_hint,
@@ -3860,6 +3970,133 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(actual.is_match());
         assert_eq!(SparseLayout::<{ 1 << 15 }, 256>::block(0), None);
+    }
+
+    #[test]
+    fn direct_chain_bulk_stores_equal_single_stores_across_empty_and_wrapped_ranges() {
+        fn check<const HASH64: bool>() {
+            let data: Vec<u8> = (0..768usize).map(|ix| (ix / 32) as u8).collect();
+            let mut batch_heads = [0; 256];
+            let mut single_heads = [0; 256];
+            let mut batch_nodes = Vec::new();
+            let mut single_nodes = Vec::new();
+            let mut batch = DirectChainRun::<HASH64, 256, 128> {
+                heads: &mut batch_heads,
+                chain: &mut batch_nodes,
+            };
+            let mut single = DirectChainRun::<HASH64, 256, 128> {
+                heads: &mut single_heads,
+                chain: &mut single_nodes,
+            };
+            for (start, end) in [(0, 0), (9, 3), (5, 120), (240, 280), (532, 700)] {
+                batch.store_range(&data, 255, start, end);
+                for ix in start..end {
+                    single.store(&data, 255, ix);
+                }
+                assert_eq!(batch.heads, single.heads);
+                assert_eq!(batch.chain, single.chain);
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn direct_chains_match_sparse_bucket_depth_and_order_on_every_backend() {
+        fn check<const HASH64: bool>() {
+            let mut data: Vec<u8> = (0..4096usize).map(|ix| ((ix / 16) ^ ix) as u8).collect();
+            // Long runs exercise buckets deeper than the retained 128 nodes.
+            data[..1024].fill(b'a');
+            for backend in crate::compressor::Backend::available() {
+                let mut direct = BucketMatcher::<HASH64, 256, 128, { 256 * 128 }>::new(data.len());
+                direct.prepare(true, data.len(), &data, true);
+                let Layout::Compact(layout) = &direct.layout else {
+                    panic!("bounded chain layout");
+                };
+                assert!(layout.heads.is_some());
+                let mut sparse = BucketMatcher::<HASH64, 256, 128, { 256 * 128 }>::new(0);
+                sparse.prepare(false, data.len(), &data, true);
+                assert!(matches!(sparse.layout, Layout::Sparse(_)));
+                for (start, end) in [(0, 0), (32, 512), (544, 2048)] {
+                    direct.store_range(&data, usize::MAX, start, end);
+                    sparse.store_range(&data, usize::MAX, start, end);
+                    for position in end..end + 32 {
+                        assert_eq!(
+                            search_with(backend.0, &mut direct, &data, position),
+                            search_with(backend.0, &mut sparse, &data, position),
+                            "{backend:?}, hash64={HASH64}, position={position}",
+                        );
+                    }
+                }
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn direct_chains_reset_reuse_heads_and_release_them_for_tiny_inputs() {
+        let data = [b'a'; 4096];
+        let mut matcher = BucketMatcher::<false, 256, 128, { 256 * 128 }>::new(data.len());
+        matcher.prepare(true, data.len(), &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        let heads = layout.heads.as_ref().unwrap().as_ptr();
+        assert_eq!(
+            matcher.retained_bytes(),
+            256 * size_of::<u32>() + data.len() * size_of::<u64>()
+        );
+        matcher.store_range(&data, usize::MAX, 0, 256);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        let key = (hash_with_tag::<false, 256>(&data, 0) >> 8) & 255;
+        assert_eq!(layout.heads.as_ref().unwrap()[key], 256);
+        assert_eq!(layout.chain[255], 255 | (255u64 << 32));
+        matcher.prepare(true, data.len(), &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        assert_eq!(layout.heads.as_ref().unwrap().as_ptr(), heads);
+        assert!(layout.heads.as_ref().unwrap().iter().all(|&head| head == 0));
+        assert!(layout.chain.is_empty());
+        matcher.prepare(true, 16, &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("tiny chain layout");
+        };
+        assert!(layout.heads.is_none());
+        matcher.store(&data, usize::MAX, 0);
+        assert!(search_at(&mut matcher, &data, 16).is_match());
+    }
+
+    #[test]
+    fn direct_chains_are_bounded_and_avoid_long_ordinary_text() {
+        type Matcher = BucketMatcher<false, { 1 << 15 }, 128, { (1 << 15) * 128 }>;
+        let binary: Vec<u8> = (0..DIRECT_CHAIN_INPUT_LIMIT + 1)
+            .map(|ix| ((ix / 16) ^ ix) as u8)
+            .collect();
+        let text = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/brotli-ffi/vendor/brotli/tests/testdata/alice29.txt"
+        ));
+        for (one_shot, size, input, direct) in [
+            (true, COMPACT_INPUT_LIMIT, &binary[..], false),
+            (true, COMPACT_INPUT_LIMIT + 1, &binary[..], true),
+            (true, DIRECT_CHAIN_ORDINARY_LIMIT, &text[..], true),
+            (true, DIRECT_CHAIN_ORDINARY_LIMIT + 1, &text[..], false),
+            (true, DIRECT_CHAIN_INPUT_LIMIT, &binary[..], true),
+            (true, DIRECT_CHAIN_INPUT_LIMIT + 1, &binary[..], false),
+            (false, DIRECT_CHAIN_ORDINARY_LIMIT, &binary[..], false),
+        ] {
+            let mut matcher = Matcher::new(size);
+            matcher.prepare(one_shot, size, input, true);
+            assert_eq!(
+                matches!(&matcher.layout, Layout::Compact(layout) if layout.heads.is_some()),
+                direct,
+                "one_shot={one_shot}, size={size}",
+            );
+        }
     }
 
     #[test]

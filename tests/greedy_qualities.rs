@@ -562,3 +562,38 @@ fn short_inputs_match_the_c_encoder_at_every_length() {
         }
     }
 }
+
+#[test]
+fn bounded_chain_boundaries_match_c_on_every_backend_and_after_reuse() {
+    let binary: Vec<u8> = (0..65_537usize).map(|ix| ((ix / 16) ^ ix) as u8).collect();
+    let text = vendor_file("alice29.txt");
+    for quality in [Quality::Q7, Quality::Q8, Quality::Q9] {
+        let config = EncoderConfig::default().with_quality(quality);
+        for (_, backend) in support::host_levels() {
+            let mut reused = Compressor::builder(config)
+                .with_backend(backend)
+                .build()
+                .unwrap();
+            for len in [1024, 1025, 32_768, 32_769, 65_535, 65_536, 65_537, 8192] {
+                for input in [&binary[..len], &text[..len]] {
+                    let expected =
+                        support::c_compress_native_one_shot(i32::from(quality.get()), 22, input);
+                    let mut fresh = Compressor::builder(config)
+                        .with_backend(backend)
+                        .build()
+                        .unwrap();
+                    assert_eq!(
+                        fresh.compress(input).unwrap(),
+                        expected,
+                        "fresh {quality:?}, {backend:?}, len={len}"
+                    );
+                    assert_eq!(
+                        reused.compress(input).unwrap(),
+                        expected,
+                        "reused {quality:?}, {backend:?}, len={len}"
+                    );
+                }
+            }
+        }
+    }
+}
