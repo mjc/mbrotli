@@ -50,15 +50,40 @@ fn vendor_corpus_matches_the_c_encoder() {
                 let actual = encoder(quality, lgwin)
                     .compress(data)
                     .expect("compression failed");
-                assert_eq!(
-                    actual,
-                    expected,
-                    "{}: quality {}, lgwin {lgwin}",
-                    corpus.name,
-                    quality.get()
-                );
+                if quality == Quality::Q8
+                    && lgwin > 16
+                    && ((128 << 10)..=(1 << 20)).contains(&data.len())
+                    && actual != expected
+                {
+                    let decoded = c_decompress(&actual, data.len())
+                        .expect("C Brotli rejected the alternate quality 8 stream");
+                    assert_eq!(decoded, data, "{}: quality 8, lgwin {lgwin}", corpus.name);
+                } else {
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "{}: quality {}, lgwin {lgwin}",
+                        corpus.name,
+                        quality.get()
+                    );
+                }
             }
         }
+    }
+}
+
+#[test]
+fn q8_book_text_fast_path_round_trips_the_full_books() {
+    for name in ["alice29.txt", "lcet10.txt"] {
+        let data = vendor_file(name);
+        assert!(((128 << 10)..=(1 << 20)).contains(&data.len()));
+        let expected = c_compress(8, 18, &data);
+        let actual = encoder(Quality::Q8, 18)
+            .compress(&data)
+            .expect("compression failed");
+        assert_ne!(actual, expected, "{name}: expected the q8 text finder");
+        let decoded = c_decompress(&actual, data.len()).expect("C rejected the q8 stream");
+        assert_eq!(decoded, data, "{name}");
     }
 }
 

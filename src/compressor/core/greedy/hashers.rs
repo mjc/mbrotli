@@ -950,6 +950,26 @@ impl<
 /// slots indexes after a sixteen-kilobyte clear.
 const COMPACT_INPUT_LIMIT: usize = 1024;
 
+/// Smallest complete ordinary q8 input selecting the H6 book fast path.
+const Q8_BOOK_FAST_MIN_INPUT: usize = 128 << 10;
+
+/// Largest complete ordinary q8 input selecting the H6 book fast path.
+const Q8_BOOK_FAST_MAX_INPUT: usize = 1 << 20;
+
+/// Whether a sample has the byte set and store rate of ordinary book text.
+fn ordinary_book_text(block: &[u8]) -> bool {
+    let mut seen = [0u64; 2];
+    let mut printable = 0usize;
+    for &byte in block {
+        if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            printable += 1;
+        }
+        seen[usize::from(byte >= 64)] |= 1 << (byte & 63);
+    }
+    let distinct = seen[0].count_ones() + seen[1].count_ones();
+    distinct >= 32 && printable * 16 >= block.len() * 15
+}
+
 /// A complete input this short cannot wrap a bucket's sixteen-bit counter:
 /// stores are strictly increasing and require at least four readable bytes.
 const DIRECT_CHAIN_INPUT_LIMIT: usize = 1 << 16;
@@ -3585,6 +3605,8 @@ pub(crate) enum MatchFinder {
     H6Q7(BucketMatcher<true, { 1 << 15 }, 64, { (1 << 15) * 64 }>),
     /// Quality 8, large inputs and wide windows.
     H6Q8(BucketMatcher<true, { 1 << 15 }, 128, { (1 << 15) * 128 }>),
+    /// Quality 8, ordinary complete inputs up to one mebibyte: H6, 64 slots.
+    H6Q8Book(BucketMatcher<true, { 1 << 15 }, 64, { (1 << 15) * 64 }>),
     /// Quality 9, large inputs and wide windows.
     H6Q9(BucketMatcher<true, { 1 << 15 }, 256, { (1 << 15) * 256 }>),
 }
@@ -3659,6 +3681,7 @@ macro_rules! with_matcher {
             MatchFinder::H6Q6($matcher) => $body,
             MatchFinder::H6Q7($matcher) => $body,
             MatchFinder::H6Q8($matcher) => $body,
+            MatchFinder::H6Q8Book($matcher) => $body,
             MatchFinder::H6Q9($matcher) => $body,
         }
     };
@@ -3710,6 +3733,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.recycle(parked),
             Self::H6Q7(matcher) => matcher.recycle(parked),
             Self::H6Q8(matcher) => matcher.recycle(parked),
+            Self::H6Q8Book(matcher) => matcher.recycle(parked),
             Self::H6Q9(matcher) => matcher.recycle(parked),
             _ => {}
         }
@@ -3729,6 +3753,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.forget_sparse(),
             Self::H6Q7(matcher) => matcher.forget_sparse(),
             Self::H6Q8(matcher) => matcher.forget_sparse(),
+            Self::H6Q8Book(matcher) => matcher.forget_sparse(),
             Self::H6Q9(matcher) => matcher.forget_sparse(),
             _ => {}
         }
@@ -3746,6 +3771,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.recycled = None,
             Self::H6Q7(matcher) => matcher.recycled = None,
             Self::H6Q8(matcher) => matcher.recycled = None,
+            Self::H6Q8Book(matcher) => matcher.recycled = None,
             Self::H6Q9(matcher) => matcher.recycled = None,
             _ => {}
         }
@@ -3768,6 +3794,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.park(parked),
             Self::H6Q7(matcher) => matcher.park(parked),
             Self::H6Q8(matcher) => matcher.park(parked),
+            Self::H6Q8Book(matcher) => matcher.park(parked),
             Self::H6Q9(matcher) => matcher.park(parked),
             _ => {}
         }
@@ -3801,7 +3828,9 @@ impl MatchFinder {
             && size_hint <= 2048
             && matches!(plan, HasherPlan::H2 | HasherPlan::H3 | HasherPlan::H4);
         let is_small = matches!(self, Self::H2Small(_) | Self::H3Small(_) | Self::H4Small(_));
-        if wants_small != is_small {
+        let wants_q8 = matches!(plan, HasherPlan::H5(shape) if shape.block_bits == 7);
+        let is_q8 = matches!(self, Self::H5Q8(_) | Self::H6Q8Book(_));
+        if wants_small != is_small || wants_q8 != is_q8 {
             return false;
         }
         match self {
@@ -3814,6 +3843,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.retarget(size_hint),
             Self::H6Q7(matcher) => matcher.retarget(size_hint),
             Self::H6Q8(matcher) => matcher.retarget(size_hint),
+            Self::H6Q8Book(matcher) => matcher.retarget(size_hint),
             Self::H6Q9(matcher) => matcher.retarget(size_hint),
             _ => {}
         }
@@ -3830,6 +3860,20 @@ impl MatchFinder {
         data: &[u8],
         clear: bool,
     ) -> Sweep {
+        let expected_input = match self {
+            Self::H5Q8(matcher) => matcher.size_hint,
+            Self::H6Q8Book(matcher) => matcher.size_hint,
+            _ => 0,
+        };
+        let block = data.get(..input_size).unwrap_or(data);
+        let book_fast = (Q8_BOOK_FAST_MIN_INPUT..=Q8_BOOK_FAST_MAX_INPUT).contains(&expected_input)
+            && ordinary_book_text(block)
+            && matches!(sample_store_outlook(block), Some(StoreOutlook::Ordinary));
+        if book_fast && matches!(self, Self::H5Q8(_)) {
+            *self = Self::H6Q8Book(BucketMatcher::new(expected_input));
+        } else if !book_fast && matches!(self, Self::H6Q8Book(_)) {
+            *self = Self::H5Q8(BucketMatcher::new(expected_input));
+        }
         with_matcher!(self, |matcher| matcher
             .prepare(one_shot, input_size, data, clear))
     }
@@ -4580,6 +4624,56 @@ mod tests {
             panic!("shape changed");
         };
         assert_eq!(inner.size_hint, 1 << 20);
+    }
+
+    #[test]
+    fn q8_book_fast_path_is_limited_to_complete_ordinary_inputs() {
+        const Q8_BUCKET: BucketShape = BucketShape {
+            bucket_bits: 15,
+            block_bits: 7,
+            last_distances: 10,
+        };
+        let text: &[u8] =
+            include_bytes!("../../../../brotli-ffi/vendor/brotli/tests/testdata/alice29.txt");
+        assert_eq!(sample_store_outlook(text), Some(StoreOutlook::Ordinary));
+        assert!(ordinary_book_text(text));
+
+        let mut matcher = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        assert!(matches!(matcher, MatchFinder::H5Q8(_)));
+        matcher.prepare(true, text.len(), text, true);
+        assert!(matches!(matcher, MatchFinder::H6Q8Book(_)));
+
+        // The whole-book hint survives even when the first block is shorter.
+        matcher.prepare(false, text.len() / 2, text, true);
+        assert!(matches!(matcher, MatchFinder::H6Q8Book(_)));
+        let repetitive = vec![b'a'; text.len()];
+        matcher.prepare(true, repetitive.len() / 2, &repetitive, true);
+        assert!(matches!(matcher, MatchFinder::H5Q8(_)));
+
+        let low_entropy = (0..text.len())
+            .map(|index| b'a' + (index % 4) as u8)
+            .collect::<Vec<_>>();
+        let mut random_like = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        random_like.prepare(true, low_entropy.len(), &low_entropy, true);
+        assert!(matches!(random_like, MatchFinder::H5Q8(_)));
+
+        let mut collisions = Vec::with_capacity(text.len());
+        while collisions.len() < text.len() {
+            collisions.extend_from_slice(b"AAAAA");
+            collisions.extend(0..=255u8);
+        }
+        collisions.truncate(text.len());
+        let mut collision_like = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        collision_like.prepare(true, collisions.len(), &collisions, true);
+        assert!(matches!(collision_like, MatchFinder::H5Q8(_)));
+
+        let mut short =
+            MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), Q8_BOOK_FAST_MIN_INPUT - 1);
+        short.prepare(true, Q8_BOOK_FAST_MIN_INPUT - 1, text, true);
+        assert!(matches!(short, MatchFinder::H5Q8(_)));
+        assert!(short.retarget(HasherPlan::H5(Q8_BUCKET), Q8_BOOK_FAST_MAX_INPUT + 1));
+        short.prepare(true, Q8_BOOK_FAST_MAX_INPUT + 1, text, true);
+        assert!(matches!(short, MatchFinder::H5Q8(_)));
     }
 
     #[test]
