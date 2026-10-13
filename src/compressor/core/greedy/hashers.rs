@@ -21,7 +21,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
-use fearless_simd::{Simd, SimdBase, SimdMask, u8x16, u8x32, u32x16};
+use fearless_simd::{Simd, SimdBase, SimdMask, u8x16, u8x32, u32x4, u32x16};
 use fearless_simd_macros::simd;
 
 use super::super::cache_probe::ProbeSite;
@@ -243,6 +243,19 @@ pub(crate) trait MatchRun {
 
     /// Records every position in `start..end` (`StoreRange`).
     fn store_range(&mut self, data: &[u8], mask: usize, start: usize, end: usize);
+
+    /// Records a range in the SIMD context selected for this block.
+    #[inline(always)]
+    fn store_range_simd<S: Simd>(
+        &mut self,
+        _simd: S,
+        data: &[u8],
+        mask: usize,
+        start: usize,
+        end: usize,
+    ) {
+        self.store_range(data, mask, start, end);
+    }
 
     /// Searches for the best match at `query.cur_ix` (`FindLongestMatch`).
     ///
@@ -937,6 +950,37 @@ impl<
 /// slots indexes after a sixteen-kilobyte clear.
 const COMPACT_INPUT_LIMIT: usize = 1024;
 
+/// Smallest complete ordinary q8 input selecting the H6 book fast path.
+const Q8_BOOK_FAST_MIN_INPUT: usize = 128 << 10;
+
+/// Largest complete ordinary q8 input selecting the H6 book fast path.
+const Q8_BOOK_FAST_MAX_INPUT: usize = 1 << 20;
+
+/// Whether a sample has the byte set and store rate of ordinary book text.
+fn ordinary_book_text(block: &[u8]) -> bool {
+    let mut seen = [0u64; 2];
+    let mut printable = 0usize;
+    for &byte in block {
+        if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            printable += 1;
+        }
+        seen[usize::from(byte >= 64)] |= 1 << (byte & 63);
+    }
+    let distinct = seen[0].count_ones() + seen[1].count_ones();
+    distinct >= 32 && printable * 16 >= block.len() * 15
+}
+
+/// A complete input this short cannot wrap a bucket's sixteen-bit counter:
+/// stores are strictly increasing and require at least four readable bytes.
+const DIRECT_CHAIN_INPUT_LIMIT: usize = 1 << 16;
+
+/// Maximum stores in a direct chain: input positions start at zero and each
+/// store needs at least four readable bytes in a 64 KiB input.
+const DIRECT_CHAIN_MAX_STORES: usize = u16::MAX as usize - 2;
+
+/// Longer ordinary inputs spend enough time traversing chains to prefer buckets.
+const DIRECT_CHAIN_ORDINARY_LIMIT: usize = 1 << 15;
+
 /// Positions an on-demand search runs between two looks at its store rate
 /// (see [`Matcher::checkpoint`]).
 ///
@@ -1105,17 +1149,21 @@ fn hash_with_tag<const HASH64: bool, const BUCKETS: usize>(data: &[u8], offset: 
 
 /// Storage owned exclusively by the current bucket layout.
 enum Layout<const BUCKETS: usize, const BLOCK: usize, const SLOTS: usize> {
-    Compact(CompactLayout),
+    Compact(CompactLayout<BUCKETS>),
     Sparse(SparseLayout<BUCKETS, BLOCK>),
     Dense(DenseLayout<BUCKETS, BLOCK, SLOTS>),
 }
 
-/// Short-stream bucket heads and linked positions.
+/// Bounded-stream bucket heads and linked positions.
 #[derive(Default)]
-struct CompactLayout {
+struct CompactLayout<const BUCKETS: usize> {
     compact: KeyMap,
-    /// Low word: position; high word: one-based index of the older node.
+    /// Direct heads for bounded one-shot inputs; absent for the tiny key map.
+    heads: Option<Box<[u16; BUCKETS]>>,
+    /// Low word: position; high word: one-based older-node index.
     chain: Vec<u64>,
+    /// Packed direct-chain nodes retained across resets and layout changes.
+    direct_chain: Vec<u32>,
 }
 
 /// On-demand blocks and their generation-stamped bucket index.
@@ -1197,7 +1245,10 @@ const fn last_distances_for(block: usize) -> usize {
 /// bumping the generation. A one-shot stream of at most
 /// [`COMPACT_INPUT_LIMIT`] bytes uses neither: it links every store into a
 /// per-bucket chain indexed through a small [`KeyMap`], so a sixteen-byte
-/// call never zeroes the table and a store is one push.
+/// call never zeroes the table and a store is one push. Deep shapes use
+/// chains for complete inputs through 32 KiB, and through 64 KiB when sampling
+/// predicts incompressibility. Those chains have direct bucket heads:
+/// no key map, per-bucket counter, starter promotion, or full-block copying.
 ///
 /// Slots fill downwards, as the reference's tagged matchers do: the newest
 /// position sits at the lowest occupied slot and older ones follow it
@@ -1274,6 +1325,12 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
             + match &self.layout {
                 Layout::Compact(layout) => {
                     (layout.compact.entries.capacity() + layout.chain.capacity()) * size_of::<u64>()
+                        + layout.direct_chain.capacity() * size_of::<u32>()
+                        + if layout.heads.is_some() {
+                            BUCKETS * size_of::<u16>()
+                        } else {
+                            0
+                        }
                 }
                 Layout::Sparse(layout) => {
                     BUCKETS * size_of::<u64>()
@@ -1469,21 +1526,58 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     /// `block` is the stream's first block, which [`Self::wants_dense`] may
     /// sample.
     fn select_layout(&mut self, one_shot: bool, input_size: usize, block: &[u8]) {
+        let direct = matches!(self.layout, Layout::Compact(_))
+            && one_shot
+            && !Self::TAGGED
+            && input_size > COMPACT_INPUT_LIMIT
+            && input_size <= DIRECT_CHAIN_INPUT_LIMIT
+            && (input_size <= DIRECT_CHAIN_ORDINARY_LIMIT
+                || matches!(
+                    sample_store_outlook(block),
+                    Some(StoreOutlook::Incompressible)
+                ));
         let compact = matches!(self.layout, Layout::Compact(_))
             && one_shot
-            && input_size <= COMPACT_INPUT_LIMIT;
+            && (input_size <= COMPACT_INPUT_LIMIT || direct);
         let dense =
             matches!(self.layout, Layout::Dense(_)) || (!compact && self.wants_dense(block));
         let previous =
             ::core::mem::replace(&mut self.layout, Layout::Compact(CompactLayout::default()));
         self.layout = match previous {
             Layout::Compact(mut layout) if compact => {
-                layout.compact.reset(input_size);
+                if direct {
+                    match layout.heads.as_deref_mut() {
+                        Some(heads) => heads.fill(0),
+                        None => layout.heads = Some(fixed_table(0)),
+                    }
+                } else {
+                    layout.heads = None;
+                    layout.compact.reset(input_size);
+                }
                 layout.chain.clear();
-                layout.chain.reserve(input_size);
+                if direct {
+                    layout.direct_chain.clear();
+                    layout.direct_chain.reserve(input_size);
+                } else {
+                    layout.direct_chain.clear();
+                    layout.chain.reserve(input_size);
+                }
                 Layout::Compact(layout)
             }
-            Layout::Compact(layout) if !dense => Layout::Sparse(layout.into()),
+            Layout::Compact(mut layout) if !dense => {
+                if layout.direct_chain.capacity() != 0 {
+                    let mut packed_nodes = core::mem::take(&mut layout.direct_chain);
+                    packed_nodes.clear();
+                    if let Some((words, _)) = &mut self.recycled {
+                        if packed_nodes.capacity() > words.capacity() {
+                            *words = packed_nodes;
+                        }
+                    } else {
+                        self.recycled = Some((packed_nodes, Vec::new()));
+                    }
+                }
+                Layout::Sparse(layout.into())
+            }
             Layout::Sparse(mut layout) if !dense => {
                 if layout.generation == MAX_GENERATION {
                     layout.entries.fill(0);
@@ -1533,7 +1627,7 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     }
 }
 
-impl CompactLayout {
+impl<const BUCKETS: usize> CompactLayout<BUCKETS> {
     /// Links `ix` in front of the chain of `key`, whose map entry — at
     /// `slot`, already read as `count` stores and chain head `head` — is
     /// then updated to name the new node.
@@ -1678,10 +1772,10 @@ impl<const BUCKETS: usize, const BLOCK: usize, const SLOTS: usize>
     }
 }
 
-impl<const BUCKETS: usize, const BLOCK: usize> From<CompactLayout>
+impl<const BUCKETS: usize, const BLOCK: usize> From<CompactLayout<BUCKETS>>
     for SparseLayout<BUCKETS, BLOCK>
 {
-    fn from(compact: CompactLayout) -> Self {
+    fn from(compact: CompactLayout<BUCKETS>) -> Self {
         // Keep the larger u64 allocation; discard its old map/chain encoding.
         let mut entries = if compact.compact.entries.capacity() >= compact.chain.capacity() {
             compact.compact.entries
@@ -1884,36 +1978,56 @@ impl<const BUCKETS: usize, const BLOCK: usize> SparseLayout<BUCKETS, BLOCK> {
         let key = hash >> 8;
         let tag = hash as u8;
         let (count, offset) = self.decode_entry(self.entries[key & (BUCKETS - 1)]);
-        match Self::block(offset) {
+        let block = Self::block(offset);
+        // Compute full-bucket tag matches before the shared cache probes.
+        // Starter scans do not filter by tags; untagged shapes need no mask.
+        let equal = match block {
+            Some(BlockRef::Full(index)) if Self::TAGGED && count != 0 => self
+                .block_tags
+                .get(index)
+                .map_or(u32::MAX, |tags| tag_equality::<S, BLOCK>(simd, tags, tag)),
+            _ => u32::MAX,
+        };
+        let (best_len, mut found) = probe_last_distances::<S, BLOCK>(simd, &query, out);
+        let scan = BucketScan {
+            simd,
+            data: query.data,
+            window: query.window,
+            cur_ix: query.cur_ix,
+            mask: query.mask,
+            max_backward: query.max_backward,
+            max_length: query.max_length,
+        };
+        match block {
             Some(BlockRef::Full(index)) => {
-                let bucket = self.blocks.get(index).unwrap_or(&[0; BLOCK]);
-                let tags = if Self::TAGGED {
-                    self.block_tags.get(index)
-                } else {
-                    None
-                };
-                search_bucket::<S, HASH64, BLOCK, BLOCK>(
-                    simd, &query, out, tag, count, bucket, tags,
-                );
+                let available = usize::from(count).min(BLOCK);
+                if available != 0 {
+                    let bucket = self.blocks.get(index).unwrap_or(&[0; BLOCK]);
+                    let newest = !usize::from(count.wrapping_sub(1)) & (BLOCK - 1);
+                    scan_bucket::<S, HASH64, BLOCK>(
+                        scan, bucket, equal, newest, available, best_len, &mut found,
+                    );
+                }
             }
             Some(BlockRef::Starter(index)) => {
-                let bucket = self.starters.get(index).unwrap_or(&[0; STARTER_SLOTS]);
-                search_bucket::<S, HASH64, STARTER_SLOTS, BLOCK>(
-                    simd, &query, out, tag, count, bucket, None,
-                );
+                let available = usize::from(count).min(STARTER_SLOTS);
+                if available != 0 {
+                    let bucket = self.starters.get(index).unwrap_or(&[0; STARTER_SLOTS]);
+                    let newest = !usize::from(count.wrapping_sub(1)) & (STARTER_SLOTS - 1);
+                    scan_bucket::<S, HASH64, STARTER_SLOTS>(
+                        scan,
+                        bucket,
+                        u32::MAX,
+                        newest,
+                        available,
+                        best_len,
+                        &mut found,
+                    );
+                }
             }
-            None => {
-                search_bucket::<S, HASH64, STARTER_SLOTS, BLOCK>(
-                    simd,
-                    &query,
-                    out,
-                    tag,
-                    0,
-                    &[0; STARTER_SLOTS],
-                    None,
-                );
-            }
+            None => {}
         }
+        write_back(out, found);
         self.push_found(key, count, offset, query.cur_ix as u32, tag, size_hint);
         if min_score == out.score {
             query.search_dictionary::<false>(stats, out);
@@ -2264,23 +2378,53 @@ fn search_bucket<S: Simd, const HASH64: bool, const N: usize, const BLOCK: usize
     write_back(out, found);
 }
 
-/// Runs the cached-distance probes and a compact chain walk for one search.
+/// Packed and unpacked chain node accessors used by the monomorphized walk.
+trait ChainNode: Copy {
+    fn position(self) -> u32;
+    fn previous(self) -> usize;
+}
+
+impl ChainNode for u64 {
+    #[inline(always)]
+    fn position(self) -> u32 {
+        self as u32
+    }
+
+    #[inline(always)]
+    fn previous(self) -> usize {
+        (self >> 32) as usize
+    }
+}
+
+impl ChainNode for u32 {
+    #[inline(always)]
+    fn position(self) -> u32 {
+        self as u16 as u32
+    }
+
+    #[inline(always)]
+    fn previous(self) -> usize {
+        (self >> 16) as usize
+    }
+}
+
+/// Runs cached-distance probes, then walks the newest `BLOCK` nodes of the
+/// bucket chain in the same order as the dense bucket scan.
 ///
-/// `head` names the newest node of the bucket's chain and `count` how many
-/// stores the bucket has seen; the walk visits the newest `BLOCK` of them in
-/// the order a block scan would, judging each with the same filter.
+/// The node trait lets the small direct-chain layout use packed positions and
+/// links while the tiny key-map path keeps its existing `u64` nodes.
 #[inline(always)]
-fn search_chain<S: Simd, const HASH64: bool, const BLOCK: usize>(
+fn search_chain<S: Simd, const HASH64: bool, const BLOCK: usize, N: ChainNode>(
     simd: S,
     query: &MatchQuery<'_>,
     out: &mut SearchResult,
     count: u16,
-    head: u32,
-    chain: &[u64],
+    head: usize,
+    chain: &[N],
 ) {
     let (best_len, mut found) = probe_last_distances::<S, BLOCK>(simd, query, out);
     let mut remaining = usize::from(count).min(BLOCK);
-    let mut link = head as usize;
+    let mut link = head;
     if remaining != 0 && link != 0 {
         let data = query.data;
         let scan = BucketScan {
@@ -2300,10 +2444,10 @@ fn search_chain<S: Simd, const HASH64: bool, const BLOCK: usize>(
         while remaining != 0
             && let Some(&node) = chain.get(link.wrapping_sub(1))
         {
-            if !consider::<S, HASH64>(scan, node as u32, &mut best, &mut found) {
+            if !consider::<S, HASH64>(scan, node.position(), &mut best, &mut found) {
                 break;
             }
-            link = (node >> 32) as usize;
+            link = node.previous();
             remaining -= 1;
         }
     }
@@ -2550,7 +2694,7 @@ struct SparseRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usiz
 
 /// Compact storage borrowed once per block.
 struct CompactRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usize>(
-    &'a mut CompactLayout,
+    &'a mut CompactLayout<BUCKETS>,
 );
 
 impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
@@ -2582,6 +2726,147 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
     ) {
         self.layout
             .search::<S, HASH64>(simd, stats, query, out, self.size_hint);
+    }
+}
+
+/// Direct bucket heads and append-only nodes for a bounded, complete input.
+/// The head table and dispatch are fixed for the whole run. Unlike sparse
+/// buckets, appending a node never allocates or copies a larger bucket.
+struct DirectChainRun<'a, const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> {
+    heads: &'a mut [u16; BUCKETS],
+    chain: &'a mut Vec<u32>,
+}
+
+impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize>
+    DirectChainRun<'_, HASH64, BUCKETS, BLOCK>
+{
+    /// Prepends a position to its bucket. Zero terminates a chain; heads
+    /// and links are one-based indices into the shared node buffer.
+    #[inline(always)]
+    fn push(&mut self, key: usize, ix: u32) {
+        let head = &mut self.heads[key & (BUCKETS - 1)];
+        debug_assert!(ix <= u16::MAX as u32);
+        debug_assert!(self.chain.len() < DIRECT_CHAIN_MAX_STORES);
+        self.chain
+            .push(u32::from(ix as u16) | (u32::from(*head) << 16));
+        *head = self.chain.len() as u16;
+    }
+}
+
+impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
+    for DirectChainRun<'_, HASH64, BUCKETS, BLOCK>
+{
+    const HASH_TYPE_LENGTH: usize = if HASH64 { 8 } else { 4 };
+    const STORE_LOOKAHEAD: usize = Self::HASH_TYPE_LENGTH;
+
+    #[inline(always)]
+    fn store(&mut self, data: &[u8], mask: usize, ix: usize) {
+        let hash = hash_with_tag::<HASH64, BUCKETS>(data, ix & mask);
+        self.push(hash >> 8, ix as u32);
+    }
+
+    fn store_range(&mut self, data: &[u8], mask: usize, start: usize, end: usize) {
+        let first = self.chain.len() + 1;
+        let heads = &mut *self.heads;
+        // The exact-size iterator lets Vec reserve once, then append nodes without
+        // checking capacity or updating its length after each write.
+        self.chain
+            .extend((start..end).enumerate().map(|(offset, ix)| {
+                let hash = hash_with_tag::<HASH64, BUCKETS>(data, ix & mask);
+                let head = &mut heads[(hash >> 8) & (BUCKETS - 1)];
+                debug_assert!(ix <= u16::MAX as usize);
+                debug_assert!(first + offset <= DIRECT_CHAIN_MAX_STORES);
+                let node = u32::from(ix as u16) | (u32::from(*head) << 16);
+                *head = (first + offset) as u16;
+                node
+            }));
+    }
+
+    #[inline(always)]
+    #[simd]
+    fn store_range_simd<S: Simd>(
+        &mut self,
+        simd: S,
+        data: &[u8],
+        mask: usize,
+        start: usize,
+        end: usize,
+    ) {
+        if HASH64 || simd.level().is_fallback() || end.saturating_sub(start) < 4 {
+            self.store_range(data, mask, start, end);
+            return;
+        }
+
+        // Reserve and publish the chain length in chunks, while keeping the
+        // ordered head updates that define links when lanes collide.
+        let count = end.saturating_sub(start);
+        self.chain.reserve(count);
+        let mut ix = start;
+        while end.saturating_sub(ix) >= 4 {
+            let masked = ix & mask;
+            let bytes = if mask >= 3 && masked <= mask - 3 {
+                data.get(masked..masked.saturating_add(7))
+                    .and_then(|bytes| <&[u8; 7]>::try_from(bytes).ok())
+            } else {
+                None
+            };
+            let Some(bytes) = bytes else {
+                self.store(data, mask, ix);
+                ix += 1;
+                continue;
+            };
+
+            // The checked seven-byte slice proves all four overlapping
+            // little-endian words are readable, without per-lane bounds checks.
+            let words = [
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
+                u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+                u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
+            ];
+            let hashes = (u32x4::load_array(simd, words) * u32x4::splat(simd, HASH_MUL32))
+                >> (32 - BUCKETS.ilog2());
+            let hashes: [u32; 4] = hashes.into();
+            let first = self.chain.len() + 1;
+            let mut nodes = [0; 4];
+            for (lane, hash) in hashes.into_iter().enumerate() {
+                let head = &mut self.heads[(hash as usize) & (BUCKETS - 1)];
+                debug_assert!(ix + lane <= u16::MAX as usize);
+                debug_assert!(first + lane <= DIRECT_CHAIN_MAX_STORES);
+                nodes[lane] = u32::from((ix + lane) as u16) | (u32::from(*head) << 16);
+                *head = (first + lane) as u16;
+            }
+            self.chain.extend_from_slice(&nodes);
+            ix += 4;
+        }
+        self.store_range(data, mask, ix, end);
+    }
+
+    #[inline(always)]
+    fn find_longest_match<S: Simd>(
+        &mut self,
+        simd: S,
+        stats: &mut DictionaryStats,
+        query: MatchQuery<'_>,
+        out: &mut SearchResult,
+    ) {
+        let min_score = out.score;
+        let hash = hash_with_tag::<HASH64, BUCKETS>(query.data, query.cur_ix & query.mask);
+        let key = (hash >> 8) & (BUCKETS - 1);
+        // Zero ends the chain; the walk is capped at BLOCK, and a complete input
+        // of at most 64 KiB cannot wrap C's counter.
+        search_chain::<S, HASH64, BLOCK, _>(
+            simd,
+            &query,
+            out,
+            u16::MAX,
+            self.heads[key].into(),
+            self.chain,
+        );
+        self.push(key, query.cur_ix as u32);
+        if min_score == out.score {
+            query.search_dictionary::<false>(stats, out);
+        }
     }
 }
 
@@ -2617,7 +2902,7 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize> MatchRun
         let hash = hash_with_tag::<HASH64, BUCKETS>(query.data, query.cur_ix & query.mask);
         let key = hash >> 8;
         let (slot, count, head) = self.0.compact.slot_for_write(key);
-        search_chain::<S, HASH64, BLOCK>(simd, &query, out, count, head, &self.0.chain);
+        search_chain::<S, HASH64, BLOCK, _>(simd, &query, out, count, head as usize, &self.0.chain);
         self.0
             .push_chain(key, slot, count, head, query.cur_ix as u32);
         if min_score == out.score {
@@ -2718,7 +3003,13 @@ impl<const HASH64: bool, const BUCKETS: usize, const BLOCK: usize, const SLOTS: 
     fn visit_run<V: RunVisitor>(&mut self, visitor: V) -> V::Output {
         match &mut self.layout {
             Layout::Dense(layout) => visitor.visit(layout.dense_run::<HASH64>()),
-            Layout::Compact(layout) => visitor.visit(CompactRun::<HASH64, BUCKETS, BLOCK>(layout)),
+            Layout::Compact(layout) => match layout.heads.as_deref_mut() {
+                Some(heads) => visitor.visit(DirectChainRun::<HASH64, BUCKETS, BLOCK> {
+                    heads,
+                    chain: &mut layout.direct_chain,
+                }),
+                None => visitor.visit(CompactRun::<HASH64, BUCKETS, BLOCK>(layout)),
+            },
             Layout::Sparse(layout) => visitor.visit(SparseRun::<HASH64, BUCKETS, BLOCK> {
                 layout,
                 size_hint: self.size_hint,
@@ -3314,6 +3605,8 @@ pub(crate) enum MatchFinder {
     H6Q7(BucketMatcher<true, { 1 << 15 }, 64, { (1 << 15) * 64 }>),
     /// Quality 8, large inputs and wide windows.
     H6Q8(BucketMatcher<true, { 1 << 15 }, 128, { (1 << 15) * 128 }>),
+    /// Quality 8, ordinary complete inputs up to one mebibyte: H6, 64 slots.
+    H6Q8Book(BucketMatcher<true, { 1 << 15 }, 64, { (1 << 15) * 64 }>),
     /// Quality 9, large inputs and wide windows.
     H6Q9(BucketMatcher<true, { 1 << 15 }, 256, { (1 << 15) * 256 }>),
 }
@@ -3388,6 +3681,7 @@ macro_rules! with_matcher {
             MatchFinder::H6Q6($matcher) => $body,
             MatchFinder::H6Q7($matcher) => $body,
             MatchFinder::H6Q8($matcher) => $body,
+            MatchFinder::H6Q8Book($matcher) => $body,
             MatchFinder::H6Q9($matcher) => $body,
         }
     };
@@ -3439,6 +3733,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.recycle(parked),
             Self::H6Q7(matcher) => matcher.recycle(parked),
             Self::H6Q8(matcher) => matcher.recycle(parked),
+            Self::H6Q8Book(matcher) => matcher.recycle(parked),
             Self::H6Q9(matcher) => matcher.recycle(parked),
             _ => {}
         }
@@ -3458,6 +3753,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.forget_sparse(),
             Self::H6Q7(matcher) => matcher.forget_sparse(),
             Self::H6Q8(matcher) => matcher.forget_sparse(),
+            Self::H6Q8Book(matcher) => matcher.forget_sparse(),
             Self::H6Q9(matcher) => matcher.forget_sparse(),
             _ => {}
         }
@@ -3475,6 +3771,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.recycled = None,
             Self::H6Q7(matcher) => matcher.recycled = None,
             Self::H6Q8(matcher) => matcher.recycled = None,
+            Self::H6Q8Book(matcher) => matcher.recycled = None,
             Self::H6Q9(matcher) => matcher.recycled = None,
             _ => {}
         }
@@ -3497,6 +3794,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.park(parked),
             Self::H6Q7(matcher) => matcher.park(parked),
             Self::H6Q8(matcher) => matcher.park(parked),
+            Self::H6Q8Book(matcher) => matcher.park(parked),
             Self::H6Q9(matcher) => matcher.park(parked),
             _ => {}
         }
@@ -3530,7 +3828,9 @@ impl MatchFinder {
             && size_hint <= 2048
             && matches!(plan, HasherPlan::H2 | HasherPlan::H3 | HasherPlan::H4);
         let is_small = matches!(self, Self::H2Small(_) | Self::H3Small(_) | Self::H4Small(_));
-        if wants_small != is_small {
+        let wants_q8 = matches!(plan, HasherPlan::H5(shape) if shape.block_bits == 7);
+        let is_q8 = matches!(self, Self::H5Q8(_) | Self::H6Q8Book(_));
+        if wants_small != is_small || wants_q8 != is_q8 {
             return false;
         }
         match self {
@@ -3543,6 +3843,7 @@ impl MatchFinder {
             Self::H6Q6(matcher) => matcher.retarget(size_hint),
             Self::H6Q7(matcher) => matcher.retarget(size_hint),
             Self::H6Q8(matcher) => matcher.retarget(size_hint),
+            Self::H6Q8Book(matcher) => matcher.retarget(size_hint),
             Self::H6Q9(matcher) => matcher.retarget(size_hint),
             _ => {}
         }
@@ -3559,6 +3860,20 @@ impl MatchFinder {
         data: &[u8],
         clear: bool,
     ) -> Sweep {
+        let expected_input = match self {
+            Self::H5Q8(matcher) => matcher.size_hint,
+            Self::H6Q8Book(matcher) => matcher.size_hint,
+            _ => 0,
+        };
+        let block = data.get(..input_size).unwrap_or(data);
+        let book_fast = (Q8_BOOK_FAST_MIN_INPUT..=Q8_BOOK_FAST_MAX_INPUT).contains(&expected_input)
+            && ordinary_book_text(block)
+            && matches!(sample_store_outlook(block), Some(StoreOutlook::Ordinary));
+        if book_fast && matches!(self, Self::H5Q8(_)) {
+            *self = Self::H6Q8Book(BucketMatcher::new(expected_input));
+        } else if !book_fast && matches!(self, Self::H6Q8Book(_)) {
+            *self = Self::H5Q8(BucketMatcher::new(expected_input));
+        }
         with_matcher!(self, |matcher| matcher
             .prepare(one_shot, input_size, data, clear))
     }
@@ -3863,6 +4178,220 @@ mod tests {
     }
 
     #[test]
+    fn direct_chain_bulk_stores_equal_single_stores_across_empty_and_wrapped_ranges() {
+        fn check<const HASH64: bool>() {
+            let data: Vec<u8> = (0..768usize).map(|ix| (ix / 32) as u8).collect();
+            let mut batch_heads = [0; 256];
+            let mut single_heads = [0; 256];
+            let mut batch_nodes = Vec::new();
+            let mut single_nodes = Vec::new();
+            let mut batch = DirectChainRun::<HASH64, 256, 128> {
+                heads: &mut batch_heads,
+                chain: &mut batch_nodes,
+            };
+            let mut single = DirectChainRun::<HASH64, 256, 128> {
+                heads: &mut single_heads,
+                chain: &mut single_nodes,
+            };
+            for (start, end) in [(0, 0), (9, 3), (5, 120), (240, 280), (532, 700)] {
+                batch.store_range(&data, 255, start, end);
+                for ix in start..end {
+                    single.store(&data, 255, ix);
+                }
+                assert_eq!(batch.heads, single.heads);
+                assert_eq!(batch.chain, single.chain);
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn direct_chain_simd_bulk_stores_equal_single_stores_on_every_backend() {
+        fn check<const HASH64: bool>() {
+            let data: Vec<u8> = (0..800usize).map(|ix| (ix / 32) as u8).collect();
+            for backend in crate::compressor::Backend::available() {
+                let mut batch_heads = [0; 256];
+                let mut single_heads = [0; 256];
+                let mut batch_nodes = Vec::new();
+                let mut single_nodes = Vec::new();
+                let mut batch = DirectChainRun::<HASH64, 256, 128> {
+                    heads: &mut batch_heads,
+                    chain: &mut batch_nodes,
+                };
+                let mut single = DirectChainRun::<HASH64, 256, 128> {
+                    heads: &mut single_heads,
+                    chain: &mut single_nodes,
+                };
+                for (start, end, mask) in [
+                    (0, 0, 255),
+                    (9, 3, 255),
+                    (5, 120, 255),
+                    (240, 280, 255),
+                    (532, 700, 255),
+                    (760, 768, usize::MAX),
+                    // At 793 exactly seven real bytes remain; at 794 only
+                    // six remain and the range must use the scalar fallback.
+                    (793, 797, usize::MAX),
+                    (794, 798, usize::MAX),
+                ] {
+                    dispatch!(backend.0, simd => batch.store_range_simd(simd, &data, mask, start, end));
+                    for ix in start..end {
+                        single.store(&data, mask, ix);
+                    }
+                    assert_eq!(batch.heads, single.heads, "{backend:?}");
+                    assert_eq!(batch.chain, single.chain, "{backend:?}");
+                }
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn direct_chains_match_sparse_bucket_depth_and_order_on_every_backend() {
+        fn check<const HASH64: bool>() {
+            let mut data: Vec<u8> = (0..4096usize).map(|ix| ((ix / 16) ^ ix) as u8).collect();
+            // Long runs exercise buckets deeper than the retained 128 nodes.
+            data[..1024].fill(b'a');
+            for backend in crate::compressor::Backend::available() {
+                let mut direct = BucketMatcher::<HASH64, 256, 128, { 256 * 128 }>::new(data.len());
+                direct.prepare(true, data.len(), &data, true);
+                let Layout::Compact(layout) = &direct.layout else {
+                    panic!("bounded chain layout");
+                };
+                assert!(layout.heads.is_some());
+                let mut sparse = BucketMatcher::<HASH64, 256, 128, { 256 * 128 }>::new(0);
+                sparse.prepare(false, data.len(), &data, true);
+                assert!(matches!(sparse.layout, Layout::Sparse(_)));
+                for (start, end) in [(0, 0), (32, 512), (544, 2048)] {
+                    direct.store_range(&data, usize::MAX, start, end);
+                    sparse.store_range(&data, usize::MAX, start, end);
+                    for position in end..end + 32 {
+                        assert_eq!(
+                            search_with(backend.0, &mut direct, &data, position),
+                            search_with(backend.0, &mut sparse, &data, position),
+                            "{backend:?}, hash64={HASH64}, position={position}",
+                        );
+                    }
+                }
+            }
+        }
+        check::<false>();
+        check::<true>();
+    }
+
+    #[test]
+    fn direct_chains_reset_reuse_heads_and_release_them_for_tiny_inputs() {
+        let data = [b'a'; 4096];
+        let mut matcher = BucketMatcher::<false, 256, 128, { 256 * 128 }>::new(data.len());
+        matcher.prepare(true, data.len(), &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        let heads = layout.heads.as_ref().unwrap().as_ptr();
+        assert_eq!(
+            matcher.retained_bytes(),
+            256 * size_of::<u16>() + data.len() * size_of::<u32>()
+        );
+        matcher.store_range(&data, usize::MAX, 0, 256);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        let key = (hash_with_tag::<false, 256>(&data, 0) >> 8) & 255;
+        assert_eq!(layout.heads.as_ref().unwrap()[key], 256);
+        assert_eq!(layout.direct_chain[255], 255 | (255u32 << 16));
+        matcher.prepare(true, data.len(), &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        assert_eq!(layout.heads.as_ref().unwrap().as_ptr(), heads);
+        assert!(layout.heads.as_ref().unwrap().iter().all(|&head| head == 0));
+        assert!(layout.direct_chain.is_empty());
+        matcher.prepare(true, 16, &data, true);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("tiny chain layout");
+        };
+        assert!(layout.heads.is_none());
+        matcher.store(&data, usize::MAX, 0);
+        assert!(search_at(&mut matcher, &data, 16).is_match());
+    }
+
+    #[test]
+    fn packed_direct_chain_represents_the_maximum_position_and_index() {
+        let mut heads = [0u16; 1];
+        let mut chain = Vec::with_capacity(DIRECT_CHAIN_MAX_STORES);
+        let mut run = DirectChainRun::<false, 1, 1> {
+            heads: &mut heads,
+            chain: &mut chain,
+        };
+        for position in 0..DIRECT_CHAIN_MAX_STORES {
+            run.push(0, position as u32);
+        }
+        assert_eq!(run.heads[0], DIRECT_CHAIN_MAX_STORES as u16);
+        assert_eq!(run.chain.len(), DIRECT_CHAIN_MAX_STORES);
+        assert_eq!(run.chain.last().copied(), Some(0xfffc_fffc));
+        assert_eq!(
+            run.chain.last().copied().map(|node| node.position()),
+            Some((DIRECT_CHAIN_MAX_STORES - 1) as u32)
+        );
+        assert_eq!(
+            run.chain.last().copied().map(|node| node.previous()),
+            Some(DIRECT_CHAIN_MAX_STORES - 1)
+        );
+    }
+
+    #[test]
+    fn packed_direct_chain_storage_is_reused_after_sparse_migration() {
+        // After the first stream, the dense cutoff for this matcher is 2048.
+        let data = [b'a'; 2047];
+        let mut matcher = BucketMatcher::<false, 256, 128, { 256 * 128 }>::new(data.len());
+        matcher.prepare(true, data.len(), &data, true);
+        matcher.store_range(&data, usize::MAX, 0, data.len() - 3);
+        let Layout::Compact(layout) = &matcher.layout else {
+            panic!("bounded chain layout");
+        };
+        let packed_nodes = layout.direct_chain.as_ptr();
+        matcher.prepare(false, data.len(), &data, true);
+        assert!(matches!(matcher.layout, Layout::Sparse(_)));
+        let Some((recycled, tags)) = &matcher.recycled else {
+            panic!("packed nodes should be parked for reuse");
+        };
+        assert!(tags.is_empty());
+        assert_eq!(recycled.as_ptr(), packed_nodes);
+        assert_eq!(recycled.len(), 0);
+    }
+
+    #[test]
+    fn direct_chains_are_bounded_and_avoid_long_ordinary_text() {
+        type Matcher = BucketMatcher<false, { 1 << 15 }, 128, { (1 << 15) * 128 }>;
+        let binary: Vec<u8> = (0..DIRECT_CHAIN_INPUT_LIMIT + 1)
+            .map(|ix| ((ix / 16) ^ ix) as u8)
+            .collect();
+        let text = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/brotli-ffi/vendor/brotli/tests/testdata/alice29.txt"
+        ));
+        for (one_shot, size, input, direct) in [
+            (true, COMPACT_INPUT_LIMIT, &binary[..], false),
+            (true, COMPACT_INPUT_LIMIT + 1, &binary[..], true),
+            (true, DIRECT_CHAIN_ORDINARY_LIMIT, &text[..], true),
+            (true, DIRECT_CHAIN_ORDINARY_LIMIT + 1, &text[..], false),
+            (true, DIRECT_CHAIN_INPUT_LIMIT, &binary[..], true),
+            (true, DIRECT_CHAIN_INPUT_LIMIT + 1, &binary[..], false),
+            (false, DIRECT_CHAIN_ORDINARY_LIMIT, &binary[..], false),
+        ] {
+            let mut matcher = Matcher::new(size);
+            matcher.prepare(one_shot, size, input, true);
+            assert_eq!(
+                matches!(&matcher.layout, Layout::Compact(layout) if layout.heads.is_some()),
+                direct,
+                "one_shot={one_shot}, size={size}",
+            );
+        }
+    }
+
+    #[test]
     fn every_layout_finds_the_same_match_and_forgets_it_on_prepare() {
         let data = repeated();
         for backend in crate::compressor::Backend::available() {
@@ -4095,6 +4624,56 @@ mod tests {
             panic!("shape changed");
         };
         assert_eq!(inner.size_hint, 1 << 20);
+    }
+
+    #[test]
+    fn q8_book_fast_path_is_limited_to_complete_ordinary_inputs() {
+        const Q8_BUCKET: BucketShape = BucketShape {
+            bucket_bits: 15,
+            block_bits: 7,
+            last_distances: 10,
+        };
+        let text: &[u8] =
+            include_bytes!("../../../../brotli-ffi/vendor/brotli/tests/testdata/alice29.txt");
+        assert_eq!(sample_store_outlook(text), Some(StoreOutlook::Ordinary));
+        assert!(ordinary_book_text(text));
+
+        let mut matcher = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        assert!(matches!(matcher, MatchFinder::H5Q8(_)));
+        matcher.prepare(true, text.len(), text, true);
+        assert!(matches!(matcher, MatchFinder::H6Q8Book(_)));
+
+        // The whole-book hint survives even when the first block is shorter.
+        matcher.prepare(false, text.len() / 2, text, true);
+        assert!(matches!(matcher, MatchFinder::H6Q8Book(_)));
+        let repetitive = vec![b'a'; text.len()];
+        matcher.prepare(true, repetitive.len() / 2, &repetitive, true);
+        assert!(matches!(matcher, MatchFinder::H5Q8(_)));
+
+        let low_entropy = (0..text.len())
+            .map(|index| b'a' + (index % 4) as u8)
+            .collect::<Vec<_>>();
+        let mut random_like = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        random_like.prepare(true, low_entropy.len(), &low_entropy, true);
+        assert!(matches!(random_like, MatchFinder::H5Q8(_)));
+
+        let mut collisions = Vec::with_capacity(text.len());
+        while collisions.len() < text.len() {
+            collisions.extend_from_slice(b"AAAAA");
+            collisions.extend(0..=255u8);
+        }
+        collisions.truncate(text.len());
+        let mut collision_like = MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), text.len());
+        collision_like.prepare(true, collisions.len(), &collisions, true);
+        assert!(matches!(collision_like, MatchFinder::H5Q8(_)));
+
+        let mut short =
+            MatchFinder::for_input(HasherPlan::H5(Q8_BUCKET), Q8_BOOK_FAST_MIN_INPUT - 1);
+        short.prepare(true, Q8_BOOK_FAST_MIN_INPUT - 1, text, true);
+        assert!(matches!(short, MatchFinder::H5Q8(_)));
+        assert!(short.retarget(HasherPlan::H5(Q8_BUCKET), Q8_BOOK_FAST_MAX_INPUT + 1));
+        short.prepare(true, Q8_BOOK_FAST_MAX_INPUT + 1, text, true);
+        assert!(matches!(short, MatchFinder::H5Q8(_)));
     }
 
     #[test]

@@ -171,6 +171,22 @@ fn streaming_matches_one_shot_when_the_size_is_declared() {
 }
 
 #[test]
+fn q8_declared_alice_stream_matches_the_one_shot_stream() {
+    let data = support::vendor_file("alice29.txt");
+    let mut encoder = encoder(mbrotli::Quality::try_from(8).expect("quality 8"), 22);
+    let one_shot = encoder.compress(&data).expect("compression failed");
+    let stream = StreamConfig::from(InputSize::Exact(data.len() as u64));
+
+    for streamed in [
+        compress_with_writer(&mut encoder, &data, 4096, stream),
+        compress_with_reader(&mut encoder, &data, 4096, stream),
+        compress_with_session(&mut encoder, &data, 4096, stream),
+    ] {
+        assert_eq!(streamed, one_shot);
+    }
+}
+
+#[test]
 fn universal_empty_output_intentionally_differs_from_native_c_one_shot() {
     for quality in IMPLEMENTED_QUALITIES {
         let mut compressor = encoder(quality, 22);
