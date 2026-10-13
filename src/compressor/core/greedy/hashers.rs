@@ -1958,36 +1958,56 @@ impl<const BUCKETS: usize, const BLOCK: usize> SparseLayout<BUCKETS, BLOCK> {
         let key = hash >> 8;
         let tag = hash as u8;
         let (count, offset) = self.decode_entry(self.entries[key & (BUCKETS - 1)]);
-        match Self::block(offset) {
+        let block = Self::block(offset);
+        // Compute full-bucket tag matches before the shared cache probes.
+        // Starter scans do not filter by tags; untagged shapes need no mask.
+        let equal = match block {
+            Some(BlockRef::Full(index)) if Self::TAGGED && count != 0 => self
+                .block_tags
+                .get(index)
+                .map_or(u32::MAX, |tags| tag_equality::<S, BLOCK>(simd, tags, tag)),
+            _ => u32::MAX,
+        };
+        let (best_len, mut found) = probe_last_distances::<S, BLOCK>(simd, &query, out);
+        let scan = BucketScan {
+            simd,
+            data: query.data,
+            window: query.window,
+            cur_ix: query.cur_ix,
+            mask: query.mask,
+            max_backward: query.max_backward,
+            max_length: query.max_length,
+        };
+        match block {
             Some(BlockRef::Full(index)) => {
-                let bucket = self.blocks.get(index).unwrap_or(&[0; BLOCK]);
-                let tags = if Self::TAGGED {
-                    self.block_tags.get(index)
-                } else {
-                    None
-                };
-                search_bucket::<S, HASH64, BLOCK, BLOCK>(
-                    simd, &query, out, tag, count, bucket, tags,
-                );
+                let available = usize::from(count).min(BLOCK);
+                if available != 0 {
+                    let bucket = self.blocks.get(index).unwrap_or(&[0; BLOCK]);
+                    let newest = !usize::from(count.wrapping_sub(1)) & (BLOCK - 1);
+                    scan_bucket::<S, HASH64, BLOCK>(
+                        scan, bucket, equal, newest, available, best_len, &mut found,
+                    );
+                }
             }
             Some(BlockRef::Starter(index)) => {
-                let bucket = self.starters.get(index).unwrap_or(&[0; STARTER_SLOTS]);
-                search_bucket::<S, HASH64, STARTER_SLOTS, BLOCK>(
-                    simd, &query, out, tag, count, bucket, None,
-                );
+                let available = usize::from(count).min(STARTER_SLOTS);
+                if available != 0 {
+                    let bucket = self.starters.get(index).unwrap_or(&[0; STARTER_SLOTS]);
+                    let newest = !usize::from(count.wrapping_sub(1)) & (STARTER_SLOTS - 1);
+                    scan_bucket::<S, HASH64, STARTER_SLOTS>(
+                        scan,
+                        bucket,
+                        u32::MAX,
+                        newest,
+                        available,
+                        best_len,
+                        &mut found,
+                    );
+                }
             }
-            None => {
-                search_bucket::<S, HASH64, STARTER_SLOTS, BLOCK>(
-                    simd,
-                    &query,
-                    out,
-                    tag,
-                    0,
-                    &[0; STARTER_SLOTS],
-                    None,
-                );
-            }
+            None => {}
         }
+        write_back(out, found);
         self.push_found(key, count, offset, query.cur_ix as u32, tag, size_hint);
         if min_score == out.score {
             query.search_dictionary::<false>(stats, out);
