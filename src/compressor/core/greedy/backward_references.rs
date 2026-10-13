@@ -560,7 +560,7 @@ fn commit_match<S: Simd, R: MatchRun, const ENABLE_PREFIX: bool, const INDEPENDE
     if sr.distance < (sr.len >> 2) {
         range_start = range_end.min(range_start.max(position + sr.len - (sr.distance << 2)));
     }
-    matcher.store_range(block.ringbuffer, block.mask, range_start, range_end);
+    matcher.store_range_simd(simd, block.ringbuffer, block.mask, range_start, range_end);
     cursor.position += sr.len;
     (matcher, cursor)
 }
